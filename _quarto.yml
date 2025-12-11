@@ -8,11 +8,11 @@ execute:
   message: false
 
 book:
-  title: "YOUR PROJECT TITLE"
+  title: "Air to Outcomes: An Exploratory Analysis of Pollution and Public Health"
   author:
-    - AUTHOR1 (UNI1)
-    - AUTHOR2 (UNI2)
-  repo-url: https://github.com/YOUR_GITHUB_ACCOUNT/REPO_NAME
+    - Sai Venkata Teja Bacham (sb5206)
+    - Sai Teja Dusari (sd3990)
+  repo-url: https://venkat10gitty.github.io/Air2Outcomes
   date: today
   page-footer:
     right: |
