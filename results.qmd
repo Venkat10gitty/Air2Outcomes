@@ -1,1 +1,762 @@
 # Results
+
+Across 2010–2019, We see a gentle downward drift in annual PM₂.₅ in every New York City borough, with differences between boroughs narrowing over time. Asthma and COPD mortality move more erratically from year to year, but boroughs with persistently higher pollution often appear toward the upper end of the mortality range, especially the Bronx, although the relationship is not perfectly one-to-one.
+
+When we compare New York City to the rest of New York State, the boroughs generally sit at or slightly above the statewide PM₂.₅ distribution, while their mortality experience is more mixed. The Bronx, in particular, stands out as a borough that often combines relatively poor air quality with above-average asthma/COPD mortality.
+
+```{r}
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(janitor)
+library(ggridges)
+library(sf)
+library(tigris)
+library(biscale)
+library(ggdist)
+
+options(
+  scipen = 999,
+  dplyr.summarise.inform = FALSE
+)
+
+theme_set(
+  theme_minimal(base_family = "sans") +
+    theme(
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      panel.grid.minor      = element_blank()
+    )
+)
+
+# Loading prepared data saved by data.qmd
+
+borough_panel   <- readr::read_rds("data_clean/borough_panel.rds")
+ny_county_panel <- readr::read_rds("data_clean/ny_county_panel.rds")
+nyc_boroughs    <- readr::read_rds("data_clean/nyc_boroughs.rds")
+
+analysis_years <- sort(unique(borough_panel$year))
+year_breaks    <- analysis_years
+year_limits    <- range(analysis_years)
+
+borough_panel_plot <- borough_panel |>
+  dplyr::filter(
+    !is.na(pm25_annual),
+    !is.na(mortality_rate_per_100k),
+    !is.na(total_pop)
+  ) |>
+  dplyr::arrange(borough, year)
+```
+
+## Do annual PM2.5 levels differ across boroughs, and how have they changed over time?
+
+```{r}
+ggplot(borough_panel_plot, aes(x = year, y = pm25_annual, color = borough)) +
+  geom_line(linewidth = 0.9, alpha = 0.9) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(
+    breaks = year_breaks,
+    minor_breaks = NULL,
+    limits = year_limits
+  ) +
+  labs(
+    title    = "Annual PM2.5 levels in NYC boroughs",
+    x        = "Year",
+    y        = "Annual mean PM2.5 (µg/m³)",
+    color    = "Borough",
+    caption  = "PM2.5 annual averages from EPA AQS annual summary data; borough = county."
+  ) +
+  theme(legend.position = "bottom")
+```
+
+The time-series plot shows that all five boroughs live in a fairly tight PM₂.₅ band and have been drifting downward over the decade, reflecting broad regional improvements in air quality. While there are some small gaps between boroughs in individual years, those differences are modest relative to the overall downward trend.
+
+```{r}
+library(sf)
+library(tigris)
+
+options(tigris_use_cache = TRUE)
+
+ny_counties_sf <- tigris::counties(
+  state = "NY",
+  cb    = TRUE,
+  year  = 2022
+)
+
+nyc_boroughs_sf <- ny_counties_sf |>
+  dplyr::filter(GEOID %in% nyc_boroughs$fips_state_county)
+
+map_year <- max(borough_panel_plot$year, na.rm = TRUE)
+
+borough_for_map <- borough_panel_plot |>
+  dplyr::filter(year == map_year) |>
+  dplyr::select(
+    fips_state_county,
+    borough,
+    year,
+    pm25_annual,
+    mortality_rate_per_100k
+  )
+
+nyc_boroughs_mapdata <- nyc_boroughs_sf |>
+  dplyr::left_join(
+    borough_for_map,
+    by = c("GEOID" = "fips_state_county")
+  )
+ggplot(nyc_boroughs_mapdata) +
+  geom_sf(aes(fill = pm25_annual), color = "grey40", linewidth = 0.4) +
+  scale_fill_viridis_c(option = "C", na.value = "grey90") +
+  labs(
+    title   = paste0("Annual PM2.5 by NYC borough (", map_year, ")"),
+    fill    = "PM2.5 (µg/m³)",
+    caption = "PM2.5 from EPA AQS annual summary; borough polygons from tigris counties."
+  ) +
+  theme(
+    axis.text  = element_blank(),
+    axis.title = element_blank()
+  )
+```
+For the choropleth maps we focus on 2019, which is the last year in our analysis window for which we have complete information from all three data sources (EPA AQS for PM₂.₅, CDC WONDER for asthma/COPD mortality, and ACS for population/income) for all five NYC boroughs. Earlier years have gaps (e.g., missing mortality or ACS values for one or more boroughs), which would make a borough-by-borough map misleading. We therefore use 2019 as a clean, up-to-date snapshot year and rely on the time-series plots in the previous sections to show how these patterns evolve over time.
+
+
+```{r}
+ny_pm25_median <- ny_county_panel |>
+  dplyr::filter(!is.na(pm25_annual)) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(
+    state_median_pm25 = stats::median(pm25_annual, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pm25_dumbbell <- borough_panel_plot |>
+  dplyr::select(borough, year, pm25_annual) |>
+  dplyr::left_join(ny_pm25_median, by = "year")
+
+ggplot(pm25_dumbbell,
+       aes(y = year)) +
+  geom_segment(
+    aes(
+      x    = state_median_pm25,
+      xend = pm25_annual
+    ),
+    color     = "grey70",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    aes(x = state_median_pm25),
+    color = "black",
+    size  = 2
+  ) +
+  geom_point(
+    aes(x = pm25_annual, color = borough),
+    size = 2
+  ) +
+  scale_y_continuous(breaks = analysis_years) +
+  labs(
+    title    = "Borough vs statewide median PM2.5",
+    subtitle = "Black dot = NY-state median; coloured dot = borough value",
+    x        = "PM2.5 (µg/m³)",
+    y        = "Year",
+    color    = "Borough"
+  ) +
+  facet_wrap(~ borough, ncol = 2) +
+  theme(legend.position = "bottom")
+```
+
+Comparing boroughs only to one another doesn’t tell us how they compare to the rest of New York State. This dumbbell plot anchors each year at the statewide median PM2.5 and shows how far each borough lies above or below it, making the Bronx and Manhattan’s persistently higher pollution stand out.
+
+```{r}
+if (!"GGally" %in% rownames(installed.packages())) {
+  install.packages("GGally")
+}
+library(GGally)
+
+par_data <- borough_panel_plot %>%
+  dplyr::select(
+    borough, year,
+    pm25_annual,
+    mortality_rate_per_100k,
+    total_pop,
+    median_income
+  )
+
+GGally::ggparcoord(
+  data       = par_data,
+  columns    = c(
+    which(names(par_data) == "pm25_annual"),
+    which(names(par_data) == "mortality_rate_per_100k"),
+    which(names(par_data) == "total_pop"),
+    which(names(par_data) == "median_income")
+  ),
+  groupColumn = which(names(par_data) == "borough"),
+  scale       = "uniminmax",
+  showPoints  = TRUE,
+  alphaLines  = 0.7
+) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Parallel coordinates of borough-year profiles",
+    x     = "Metric",
+    y     = "Rescaled value (0–1)",
+    color = "Borough"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+The previous plots focused on PM2.5 alone. To see the broader context, we plot PM2.5, mortality, population, and income together in a parallel-coordinates plot. This shows that the boroughs with higher pollution also tend to be denser and lower-income, hinting at structural differences behind exposure and health burden.
+
+```{r}
+pca_input <- borough_panel_plot |>
+  dplyr::select(
+    borough,
+    year,
+    pm25_annual,
+    mortality_rate_per_100k,
+    total_pop,
+    median_income
+  ) %>%
+  tidyr::drop_na()
+
+pca_numeric <- pca_input |>
+  dplyr::select(pm25_annual, mortality_rate_per_100k, total_pop, median_income)
+
+pca_fit <- prcomp(pca_numeric, scale. = TRUE)
+
+scores <- as.data.frame(pca_fit$x) |>
+  dplyr::mutate(
+    borough = pca_input$borough,
+    year    = pca_input$year,
+    year_f  = factor(pca_input$year)
+  )
+
+loadings <- as.data.frame(pca_fit$rotation[, 1:2])
+loadings$var <- rownames(loadings)
+
+arrow_scale <- 2.5
+loadings <- loadings |>
+  dplyr::mutate(
+    PC1_arrow = PC1 * arrow_scale,
+    PC2_arrow = PC2 * arrow_scale
+  )
+
+ggplot() +
+  geom_point(
+    data  = scores,
+    aes(x = PC1, y = PC2, color = borough, shape = year_f),
+    alpha = 0.85,
+    size  = 2.3
+  ) +
+  geom_segment(
+    data = loadings,
+    aes(x = 0, y = 0, xend = PC1_arrow, yend = PC2_arrow),
+    arrow = arrow(length = unit(0.2, "cm")),
+    linewidth = 0.7,
+    color = "grey30"
+  ) +
+  geom_text(
+    data = loadings,
+    aes(x = PC1_arrow, y = PC2_arrow, label = var),
+    hjust = 0.5,
+    vjust = -0.5,
+    size  = 3.3
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title    = "PCA biplot of NYC borough-year profiles",
+    subtitle = "Points: borough-years; arrows: loadings of PM2.5, mortality, population, income",
+    x        = "PC1",
+    y        = "PC2",
+    color    = "Borough",
+    shape    = "Year"
+  ) +
+  theme(
+    legend.position = "bottom",
+    panel.grid      = element_line(color = "grey90")
+  )
+```
+
+Parallel coordinates can become visually dense, so we also compress the same four variables into two principal components. The PCA biplot shows how borough-years cluster and which variables drive separation; pollution and mortality load together, while higher income points in an opposite direction.
+
+## Are higher PM2.5 levels associated with asthma/COPD mortality?
+
+```{r}
+ggplot(borough_panel_plot, aes(x = year, y = mortality_rate_per_100k, color = borough)) +
+  geom_line(linewidth = 0.9, alpha = 0.9) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(
+    breaks = year_breaks,
+    minor_breaks = NULL,
+    limits = year_limits
+  ) +
+  labs(
+    title   = "Asthma/COPD mortality in NYC boroughs",
+    x       = "Year",
+    y       = "Mortality rate per 100,000",
+    color   = "Borough",
+    caption = "Mortality from CDC WONDER (J40–J46); crude or derived rate per 100k."
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Before linking pollution and health directly, we mirror the PM₂.₅ time series with a matching time series for asthma/COPD mortality. Mortality fluctuates from year to year, with some hints of improvement in a few boroughs. However, the Bronx – and to a lesser extent Brooklyn – remain consistently toward the high end of the range, suggesting uneven health gains.
+
+```{r}
+ggplot(
+  borough_panel_plot,
+  aes(x = pm25_annual, y = mortality_rate_per_100k)
+) +
+  geom_point(size = 2, alpha = 0.8, color = "steelblue4") +
+  geom_smooth(
+    method   = "loess",
+    se       = TRUE,
+    linewidth= 0.9,
+    span     = 0.9,
+    color    = "black"
+  ) +
+  labs(
+    title = "PM2.5 vs asthma/COPD mortality by borough",
+    x     = "Annual PM2.5 (µg/m³)",
+    y     = "Mortality rate per 100,000"
+  ) +
+  facet_wrap(~ borough, ncol = 2) +
+  theme(legend.position = "none")
+```
+
+Time series don’t show how PM2.5 and mortality line up in the same year. By faceting a scatterplot of mortality vs PM2.5 for each borough, we see that some boroughs (notably the Bronx) cluster in the higher-pollution, higher-mortality corner, while Staten Island tends to occupy the lower part of the space.
+
+```{r}
+borough_summary <- borough_panel_plot |>
+  dplyr::group_by(borough) |>
+  dplyr::summarise(
+    years_covered       = paste0(min(year), "–", max(year)),
+    mean_pm25           = mean(pm25_annual, na.rm = TRUE),
+    mean_mortality_100k = mean(mortality_rate_per_100k, na.rm = TRUE),
+    pm25_sd             = stats::sd(pm25_annual, na.rm = TRUE),
+    mortality_sd        = stats::sd(mortality_rate_per_100k, na.rm = TRUE),
+    pm25_mort_cor       = if (dplyr::n() >= 3) {
+      stats::cor(pm25_annual, mortality_rate_per_100k, use = "complete.obs")
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(mean_pm25))
+
+borough_summary_long <- borough_summary %>%
+  dplyr::select(borough, mean_pm25, mean_mortality_100k) %>%
+  tidyr::pivot_longer(
+    cols      = c(mean_pm25, mean_mortality_100k),
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      mean_pm25           = "PM2.5 (µg/m³)",
+      mean_mortality_100k = "Deaths per 100k"
+    )
+  )
+
+ggplot(borough_summary_long,
+       aes(x = value, y = reorder(borough, value), color = metric)) +
+  geom_point(size = 3) +
+  facet_wrap(~ metric, scales = "free_x") +
+  labs(
+    title = "Average pollution & asthma/COPD mortality by borough",
+    x     = NULL,
+    y     = "Borough",
+    color = "Metric"
+  ) +
+  theme(legend.position = "none")
+
+# Borough Profile: Z-Scores for PM₂.₅ vs Mortality
+
+borough_profile <- borough_summary %>%
+  dplyr::mutate(
+    pm25_z = (mean_pm25 - mean(mean_pm25, na.rm = TRUE)) /
+             stats::sd(mean_pm25, na.rm = TRUE),
+    mort_z = (mean_mortality_100k - mean(mean_mortality_100k, na.rm = TRUE)) /
+             stats::sd(mean_mortality_100k, na.rm = TRUE)
+  )
+
+ggplot(borough_profile, aes(y = reorder(borough, mort_z))) +
+  geom_segment(
+    aes(x = pm25_z, xend = mort_z, yend = borough),
+    color = "grey60",
+    linewidth = 0.8
+  ) +
+  geom_point(aes(x = pm25_z), color = "steelblue4", size = 3) +
+  geom_point(aes(x = mort_z), color = "firebrick3", size = 3) +
+  labs(
+    title    = "Borough profiles: pollution vs asthma/COPD mortality",
+    subtitle = "Values are standardised (z-scores) across boroughs",
+    x        = "Standardised value (z-score)",
+    y        = "Borough"
+  ) +
+  annotate(
+    "text",
+    x = min(borough_profile$pm25_z, borough_profile$mort_z, na.rm = TRUE),
+    y = Inf,
+    label = "● PM2.5      ● Mortality",
+    hjust = 0,
+    vjust = 1.5,
+    size  = 3
+  )
+```
+
+The dot plot summarises the decade in two numbers per borough and makes the contrast clearer: boroughs with the worst air also tend to have the highest average mortality. The pattern is not perfectly one-to-one, but the same boroughs repeatedly appear toward the high-risk end of both scales.
+
+```{r}
+if (!"ggdist" %in% rownames(installed.packages())) {
+  install.packages("ggdist")
+}
+library(ggdist)
+
+year_min <- min(borough_panel_plot$year, na.rm = TRUE)
+year_max <- max(borough_panel_plot$year, na.rm = TRUE)
+mid_cut  <- floor((year_min + year_max) / 2)
+
+mort_rain <- borough_panel_plot |>
+  dplyr::mutate(
+    period = dplyr::case_when(
+      year <= mid_cut ~ paste0(year_min, "–", mid_cut),
+      TRUE            ~ paste0(mid_cut + 1, "–", year_max)
+    )
+  )
+
+ggplot(
+  mort_rain,
+  aes(x = mortality_rate_per_100k, y = borough, fill = period, color = period)
+) +
+  stat_halfeye(
+    orientation   = "horizontal",
+    alpha         = 0.6,
+    point_interval= "median_qi"
+  ) +
+  geom_jitter(
+    height = 0.1,
+    width  = 0,
+    alpha  = 0.7,
+    size   = 1.5
+  ) +
+  facet_wrap(~ period, ncol = 1) +
+  labs(
+    title   = "Asthma/COPD mortality by borough over time",
+    x       = "Deaths per 100k",
+    y       = "Borough",
+    fill    = "Period",
+    color   = "Period"
+  ) +
+  theme(legend.position = "none")
+```
+
+The scatterplots don’t easily show how the distribution of mortality changed over time within each borough. Splitting the years into early vs late periods, the raincloud plots reveal both shifts in median mortality and changes in spread, with some boroughs showing more consistent improvement than others.
+
+```{r}
+density_data <- ny_counties_sf %>%
+  dplyr::mutate(
+    area_km2 = as.numeric(sf::st_area(geometry)) / 1e6
+  ) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::select(
+    fips_state_county = GEOID,
+    area_km2
+  )
+
+ny_model_data <- ny_county_panel |>
+  dplyr::filter(
+    year %in% analysis_years,
+    !is.na(pm25_annual),
+    !is.na(mortality_rate_per_100k),
+    !is.na(median_income)
+  ) %>%
+  dplyr::left_join(density_data, by = "fips_state_county") %>%
+  dplyr::mutate(
+    pop_density = total_pop / area_km2
+  ) %>%
+  dplyr::filter(
+    !is.na(pop_density),
+    is.finite(pop_density)
+  )
+
+lm_ny <- lm(
+  mortality_rate_per_100k ~ pm25_annual + median_income + pop_density,
+  data = ny_model_data
+)
+
+ny_model_data <- ny_model_data |>
+  dplyr::mutate(
+    partial_resid_pm25 =
+      resid(lm_ny) + coef(lm_ny)[["pm25_annual"]] * pm25_annual
+  )
+
+ggplot(ny_model_data, aes(x = pm25_annual, y = partial_resid_pm25)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_smooth(
+    method   = "loess",
+    se       = TRUE,
+    linewidth= 0.9,
+    color    = "steelblue4"
+  ) +
+  labs(
+    title    = "Partial residuals for PM2.5",
+    subtitle = "From model: mortality ~ PM2.5 + income + population density",
+    x        = "PM2.5 (µg/m³)",
+    y        = "Partial residual (mortality, adjusted)"
+  )
+```
+
+All previous associations between PM2.5 and mortality were bivariate. Here we fit a simple county-level model that includes median income and population density, then plot partial residuals for PM2.5. The partial residual plot suggests that counties with higher PM₂.₅ also tend to have higher mortality even after adjusting for income and population density, though the relationship is noisy and should be interpreted as exploratory rather than causal.
+
+
+## After normalizing by population, which boroughs are outliers vs the rest of NY State?
+
+```{r}
+if (!"ggridges" %in% rownames(installed.packages())) {
+  install.packages("ggridges")
+}
+library(ggridges)
+
+pm_ridge_data <- ny_county_panel |>
+  dplyr::filter(!is.na(pm25_annual))
+
+ggplot(pm_ridge_data, aes(x = pm25_annual, y = factor(year))) +
+  ggridges::geom_density_ridges(
+    rel_min_height = 0.01,
+    fill           = "grey80",
+    color          = "grey40",
+    alpha          = 0.8
+  ) +
+  geom_point(
+    data = pm_ridge_data %>% dplyr::filter(is_nyc_borough),
+    aes(x = pm25_annual, y = factor(year)),
+    color    = "red",
+    size     = 1.6,
+    alpha    = 0.9,
+    position = position_nudge(y = -0.05)
+  ) +
+  labs(
+    title    = "NYC boroughs vs statewide PM2.5 distribution",
+    subtitle = "Ridges: all NY counties; red points: NYC boroughs",
+    x        = "Annual mean PM2.5 (µg/m³)",
+    y        = "Year",
+    caption  = "EPA AQS annual summary data, county-level; boroughs are NYC counties."
+  )
+```
+To see how NYC compares to the full statewide distribution, we plot ridges of county-level PM2.5 by year, overlaying NYC boroughs as red points. The boroughs rarely sit at the low end; in many years they lie clearly on the higher side of the statewide distribution.
+
+
+```{r}
+mort_ridge_data <- ny_county_panel |>
+  dplyr::filter(!is.na(mortality_rate_per_100k))
+
+ggplot(mort_ridge_data, aes(x = mortality_rate_per_100k, y = factor(year))) +
+  ggridges::geom_density_ridges(
+    rel_min_height = 0.01,
+    fill           = "grey80",
+    color          = "grey40",
+    alpha          = 0.8
+  ) +
+  geom_point(
+    data = mort_ridge_data %>% dplyr::filter(is_nyc_borough),
+    aes(x = mortality_rate_per_100k, y = factor(year)),
+    color    = "red",
+    size     = 1.6,
+    alpha    = 0.9,
+    position = position_nudge(y = -0.05)
+  ) +
+  labs(
+    title    = "NYC boroughs vs statewide asthma/COPD mortality distribution",
+    subtitle = "Ridges: all NY counties; red points: NYC boroughs",
+    x        = "Mortality rate per 100,000",
+    y        = "Year",
+    caption  = "CDC WONDER J40–J46 mortality; ACS population for rates where needed."
+  )
+```
+We then repeat the ridge view for asthma/COPD mortality. The Bronx especially tends to lie in the upper part of the statewide mortality distribution, suggesting that its respiratory burden is high not only relative to other boroughs but also relative to other NY counties.
+
+
+```{r}
+state_medians <- ny_county_panel |>
+  dplyr::filter(
+    year %in% analysis_years,
+    !is.na(pm25_annual),
+    !is.na(mortality_rate_per_100k)
+  ) %>%
+  dplyr::group_by(year) %>%
+  dplyr::summarise(
+    state_med_pm25  = stats::median(pm25_annual, na.rm = TRUE),
+    state_med_mort  = stats::median(mortality_rate_per_100k, na.rm = TRUE),
+    .groups         = "drop"
+  )
+
+boro_diff <- borough_panel_plot |>
+  dplyr::left_join(state_medians, by = "year") |>
+  dplyr::mutate(
+    diff_pm25 = pm25_annual - state_med_pm25,
+    diff_mort = mortality_rate_per_100k - state_med_mort
+  ) |>
+  tidyr::pivot_longer(
+    cols      = c(diff_pm25, diff_mort),
+    names_to  = "metric",
+    values_to = "diff"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      diff_pm25 = "PM2.5 difference (borough - state median)",
+      diff_mort = "Mortality difference (borough - state median)"
+    )
+  )
+
+ggplot(
+  boro_diff,
+  aes(x = diff, y = reorder(borough, diff))
+) +
+  geom_vline(xintercept = 0, color = "grey80") +
+  geom_point(aes(color = year), size = 2, alpha = 0.9) +
+  facet_wrap(~ metric, scales = "free_x") +
+  scale_color_viridis_c() +
+  labs(
+    title   = "Cleveland dot plots: borough deviations from statewide medians",
+    x       = "Difference from NY-state median",
+    y       = "Borough",
+    color   = "Year"
+  ) +
+  theme(legend.position = "bottom")
+```
+Ridge plots show where boroughs sit in the overall distribution but not by how much they differ from a “typical” county. The Cleveland dot plots recenter each year on the statewide median and show borough-level deviations for both PM2.5 and mortality, highlighting which boroughs are systematically above or below the NY median
+
+
+```{r}
+# 7D. Annual Change: Slope Chart
+
+#| label: borough-trends
+#| message: false
+#| warning: false
+
+borough_trends <- borough_panel_plot |>
+  dplyr::group_by(borough) |>
+  tidyr::nest() |>
+  dplyr::mutate(
+    lm_pm25 = purrr::map(data, ~ lm(pm25_annual ~ year, data = .x)),
+    lm_mort = purrr::map(data, ~ lm(mortality_rate_per_100k ~ year, data = .x)),
+    pm25_slope = purrr::map_dbl(lm_pm25, ~ coef(.x)[["year"]]),
+    mort_slope = purrr::map_dbl(lm_mort, ~ coef(.x)[["year"]])
+  ) |>
+  dplyr::select(borough, pm25_slope, mort_slope)
+
+borough_trends
+
+slopes_long <- borough_trends %>%
+  tidyr::pivot_longer(
+    cols      = c(pm25_slope, mort_slope),
+    names_to  = "metric",
+    values_to = "slope"
+  ) %>%
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      pm25_slope = "PM2.5 (µg/m³ per year)",
+      mort_slope = "Deaths per 100k per year"
+    )
+  )
+
+ggplot(slopes_long,
+       aes(x = slope, y = reorder(borough, slope), fill = slope < 0)) +
+  geom_vline(xintercept = 0, color = "grey80") +
+  geom_col(alpha = 0.8) +
+  facet_wrap(~ metric, scales = "free_x") +
+  scale_fill_manual(values = c("TRUE" = "steelblue4", "FALSE" = "firebrick3"), guide = "none") +
+  labs(
+    title = "Estimated annual change in PM2.5 and mortality",
+    x     = "Slope (per year)",
+    y     = "Borough"
+  )
+```
+
+
+```{r}
+if (!"biscale" %in% rownames(installed.packages())) {
+  install.packages("biscale")
+}
+library(biscale)
+
+boro_bivar <- bi_class(
+  borough_panel_plot,
+  x     = pm25_annual,
+  y     = mortality_rate_per_100k,
+  style = "quantile",
+  dim   = 3
+)
+
+ggplot(boro_bivar, aes(x = year, y = borough, fill = bi_class)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  bi_scale_fill(pal = "DkViolet", dim = 3) +
+  scale_x_continuous(breaks = analysis_years) +
+  labs(
+    title   = "Bivariate view of PM2.5 and asthma/COPD mortality",
+    x       = "Year",
+    y       = "Borough"
+  ) +
+  theme(legend.position = "none")
+```
+
+```{r}
+
+ny_zscores <- ny_county_panel |>
+  dplyr::filter(
+    !is.na(pm25_annual),
+    !is.na(mortality_rate_per_100k)
+  ) |>
+  dplyr::group_by(year) |>
+  dplyr::mutate(
+    pm25_z = (pm25_annual - mean(pm25_annual, na.rm = TRUE)) /
+             stats::sd(pm25_annual,  na.rm = TRUE),
+    mort_z = (mortality_rate_per_100k - mean(mortality_rate_per_100k, na.rm = TRUE)) /
+             stats::sd(mortality_rate_per_100k,  na.rm = TRUE)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::filter(fips_state_county %in% nyc_boroughs$fips_state_county)
+
+nyc_z_long <- ny_zscores |>
+  dplyr::select(year, county_name, pm25_z, mort_z) |>
+  tidyr::pivot_longer(
+    cols      = c(pm25_z, mort_z),
+    names_to  = "metric",
+    values_to = "z"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      pm25_z = "PM2.5 z-score",
+      mort_z = "Mortality z-score"
+    )
+  )
+
+#| fig-cap: "NYC boroughs relative to the statewide distribution (z-scores)."
+
+ggplot(nyc_z_long,
+       aes(x = factor(year), y = county_name, fill = z)) +
+  geom_tile(color = "white") +
+  facet_wrap(~ metric) +
+  scale_fill_gradient2(
+    low  = "steelblue4",
+    mid  = "white",
+    high = "firebrick3",
+    midpoint = 0
+  ) +
+  labs(
+    title    = "NYC boroughs within the New York county distribution",
+    subtitle = "Positive values indicate above-average PM2.5 or mortality relative to all NY counties",
+    x        = "Year",
+    y        = "Borough",
+    fill     = "z-score"
+  )
+```
+
+The z-score heatmap translates “above or below average” into color: warm tones mark years when a borough is well above the statewide mean, cool tones when it is well below. A few boroughs consistently light up on both the PM₂.₅ and mortality panels, reinforcing the idea that the same communities are repeatedly exposed to higher risk.
+
+
+

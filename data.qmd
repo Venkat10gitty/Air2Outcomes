@@ -1,6 +1,576 @@
 # Data
-hii
 
 ## Description
+---
+title: "Data"
+---
+Our working dataset is a simple borough–year panel for the five NYC boroughs from 2010–2019. Each row represents one borough in one year and brings together annual average PM₂.₅, asthma/COPD deaths and mortality rates, plus total population and median household income. This structure lets me compare pollution and health outcomes across boroughs on the same annual scale, while still keeping enough context to interpret differences in risk.
+
+## Technical description
+
+For this project we combine three public data sources to build a borough–year panel for New York City and compare it to the rest of New York State. First, we use the EPA Air Quality System (AQS) annual summary data, downloaded as CSVs from the AirData portal (“annual_conc_by_monitor_YYYY.zip”), to get monitor-level annual mean PM2.5 concentrations for all New York counties and then aggregate them to county–year averages. Second, We pull asthma and COPD mortality from **CDC WONDER – Underlying Cause of Death, 1999–present** by running a county × year query for New York State (ICD-10 J40–J44 and J45–J46) and exporting the output as a CSV. Third, We use the **American Community Survey 5-year estimates** via the `tidycensus` R package to obtain total population and median household income for each county–year in New York. We then map the five NYC boroughs to their county FIPS codes (Bronx, Kings, New York, Queens, Richmond) and restrict the panel to an analysis window from 2010–2019. In the repo, We keep the raw EPA and WONDER CSVs under `data_raw/aqs` and `data_raw/wonder`, and We save the unmodified ACS pulls under `data_raw/acs`, so that anyone with an AQS key and Census API key can reproduce my pipeline. The main issues We ran into were (i) the need to manually export location-level mortality from WONDER, which breaks full automation, and (ii) slight differences in coverage across sources and years, which show up later in the missing-data diagnostics.
+
+```{r}
+#| label: data-packages
+
+required_pkgs <- c(
+  "tidyverse",
+  "lubridate",
+  "janitor",
+  "glue",
+  "fs",
+  "RAQSAPI",
+  "tidycensus"
+)
+
+installed <- rownames(installed.packages())
+for (p in required_pkgs) {
+  if (!p %in% installed) {
+    install.packages(p)
+  }
+}
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+options(
+  scipen = 999,
+  dplyr.summarise.inform = FALSE
+)
+
+theme_set(
+  theme_minimal(base_family = "sans") +
+    theme(
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      panel.grid.minor      = element_blank()
+    )
+)
+```
+
+```{r}
+#| label: data-nyc-boroughs
+
+# NYC borough ↔ county FIPS
+nyc_boroughs <- tibble::tribble(
+  ~borough,        ~county_name,     ~state, ~state_fips, ~county_fips,
+  "Bronx",         "Bronx",          "NY",   "36",        "005",
+  "Brooklyn",      "Kings",          "NY",   "36",        "047",
+  "Manhattan",     "New York",       "NY",   "36",        "061",
+  "Queens",        "Queens",         "NY",   "36",        "081",
+  "Staten Island", "Richmond",       "NY",   "36",        "085"
+) |>
+  mutate(
+    fips_state_county = paste0(state_fips, county_fips)
+  )
+
+# Analysis horizon and borough–year grid
+analysis_years <- 2010:2019
+year_breaks <- analysis_years
+year_limits <- range(analysis_years)
+
+analysis_grid <- tidyr::expand_grid(
+  fips_state_county = nyc_boroughs$fips_state_county,
+  year              = analysis_years
+) |>
+  dplyr::left_join(
+    nyc_boroughs |>
+      dplyr::select(fips_state_county, borough, county_name, state),
+    by = "fips_state_county"
+  ) |>
+  dplyr::arrange(borough, year)
+
+dplyr::glimpse(analysis_grid)
+```
+This glimpse shows the final borough–year panel I work with: each row is a NYC borough in a given year, with PM2.5, asthma/COPD mortality, and ACS population/income all merged into one place.
+
+```{r}
+#| label: data-directories
+
+# Directory layout for raw data
+fs::dir_create("data_raw/aqs")
+fs::dir_create("data_raw/wonder")
+fs::dir_create("data_raw/acs")
+```
+
+```{r}
+#| label: data-credentials
+
+# AQS credentials:
+# I store AQS_EMAIL and AQS_KEY in my ~/.Renviron (not in the repo) so that
+# RAQSAPI picks them up via Sys.getenv(). Anyone reproducing the analysis
+# should do the same after signing up for an AQS key.
+
+Sys.setenv(AQS_EMAIL = "saivenkat1179@gmail.com")
+Sys.setenv(AQS_KEY   = "rubyfox12")
+
+my_aqs_email <- Sys.getenv("AQS_EMAIL")
+my_aqs_key   <- Sys.getenv("AQS_KEY")
+
+if (!nzchar(my_aqs_email) || !nzchar(my_aqs_key)) {
+  stop("AQS credentials not set. Please define AQS_EMAIL and AQS_KEY in your environment.")
+}
+
+RAQSAPI::aqs_credentials(username = my_aqs_email, key = my_aqs_key)
+
+# Census key: also stored in ~/.Renviron via tidycensus::census_api_key()
+if (!nzchar(Sys.getenv("CENSUS_API_KEY"))) {
+  stop("Census API key not found. Set it with tidycensus::census_api_key(..., install = TRUE).")
+}
+
+options(tigris_use_cache = TRUE)
+```
+
+```{r}
+#| label: data-aqs-clean
+# Read EPA AirData annual_conc_by_monitor_YYYY.csv files
+aqs_annual_files <- fs::dir_ls(
+  "data_raw/aqs",
+  regexp = "annual_conc_by_monitor_.*\\.csv$"
+)
+
+if (length(aqs_annual_files) == 0L) {
+  stop(
+    "No 'annual_conc_by_monitor_*.csv' files found in data_raw/aqs.\n",
+    "Download and unzip EPA AirData annual concentration files (annual_conc_by_monitor_YYYY.zip)\n",
+    "for the years you want and put the CSVs into data_raw/aqs/."
+  )
+}
+
+message("Reading ", length(aqs_annual_files),
+        " EPA annual concentration file(s) from data_raw/aqs ...")
+
+aqs_annual_all_clean <- purrr::map_dfr(
+  aqs_annual_files,
+  function(path) {
+    message("  - ", basename(path))
+    
+    dat <- readr::read_csv(
+      path,
+      show_col_types = FALSE,
+      guess_max      = 100000
+    ) |>
+      janitor::clean_names()
+    
+    needed <- c(
+      "state_code",
+      "county_code",
+      "site_num",
+      "parameter_code",
+      "year",
+      "arithmetic_mean"
+    )
+    
+    missing <- setdiff(needed, names(dat))
+    if (length(missing) > 0) {
+      stop(
+        "In file ", basename(path), " the following needed columns are missing: ",
+        paste(missing, collapse = ", "), "\n",
+        "Available columns are: ", paste(names(dat), collapse = ", ")
+      )
+    }
+    
+    dat |>
+      dplyr::select(dplyr::all_of(needed))
+  }
+)
+
+# County–year PM2.5 for New York (state_code 36), limited to analysis_years
+aqs_pm25_annual_ny_bycounty <- aqs_annual_all_clean |>
+  dplyr::filter(
+    state_code    == 36,
+    parameter_code == 88101
+  ) |>
+  dplyr::mutate(
+    year        = as.integer(year),
+    state_code  = as.integer(state_code),
+    county_code = as.integer(county_code),
+    state_fips  = sprintf("%02d", state_code),
+    county_fips = sprintf("%03d", county_code),
+    fips_state_county = paste0(state_fips, county_fips)
+  ) |>
+  dplyr::filter(year %in% analysis_years) |>
+  dplyr::group_by(fips_state_county, year) |>
+  dplyr::summarise(
+    pm25_annual = mean(arithmetic_mean, na.rm = TRUE),
+    n_monitors  = dplyr::n_distinct(site_num),
+    .groups     = "drop"
+  )
+
+# Restrict to NYC counties for later use
+aqs_pm25_annual_nyc_bycounty <- aqs_pm25_annual_ny_bycounty |>
+  dplyr::filter(fips_state_county %in% nyc_boroughs$fips_state_county) |>
+  dplyr::arrange(fips_state_county, year)
+
+glimpse(aqs_pm25_annual_nyc_bycounty)
+
+readr::write_rds(
+  aqs_pm25_annual_nyc_bycounty,
+  "data_raw/aqs/aqs_pm25_annual_nyc_bycounty.rds"
+)
+```
+
+This output verifies that the EPA AQS data correctly capture annual PM2.5 averages for the five NYC counties over my analysis window before I merge them into the borough panel.
+
+```{r}
+#| label: data-wonder-load
+
+# CDC WONDER:
+# I cannot query county-level breakdowns via a simple API call, so I:
+# 1) Go to CDC WONDER → Underlying Cause of Death (1999–present).
+# 2) Filter to State = New York, ICD-10 J40–J44 and J45–J46, group by Year & County.
+# 3) Export the results as CSV and save it as:
+#    data_raw/wonder/wonder_ucd_asthma_copd_ny.csv
+
+wonder_file <- "data_raw/wonder/wonder_ucd_asthma_copd_ny.csv"
+
+if (!file.exists(wonder_file)) {
+  warning(paste0(
+    "CDC WONDER mortality file not found at: ", wonder_file, "\n",
+    "Please export a CSV from WONDER (Underlying Cause of Death, NY-only, ",
+    "grouped by Year and County, filtered to J40–J44 and J45–J46) and save ",
+    "it at that path."
+  ))
+  wonder_ucd_raw <- tibble::tibble()
+} else {
+  wonder_ucd_raw <- readr::read_csv(wonder_file, show_col_types = FALSE)
+}
+
+names(wonder_ucd_raw)
+head(wonder_ucd_raw)
+```
+This table confirms that the CDC WONDER extract has asthma/COPD deaths, population, and crude rates by county and year for just the five NYC counties.
+
+```{r}
+#| label: data-wonder-clean
+
+wonder_ucd_clean <- wonder_ucd_raw |>
+  janitor::clean_names() |>
+  dplyr::filter(!is.na(year), !is.na(county)) |>
+  dplyr::mutate(
+    year        = as.integer(year),
+    county_code = as.character(county_code),
+    fips_state_county = stringr::str_pad(county_code, width = 5, side = "left", pad = "0"),
+    deaths      = suppressWarnings(as.numeric(deaths)),
+    population  = suppressWarnings(as.numeric(population)),
+    crude_rate  = suppressWarnings(as.numeric(crude_rate))
+  )
+
+wonder_nyc <- wonder_ucd_clean |>
+  dplyr::filter(fips_state_county %in% nyc_boroughs$fips_state_county) |>
+  dplyr::arrange(fips_state_county, year)
+
+glimpse(wonder_nyc)
+```
+
+
+```{r}
+#| label: data-acs-pull
+
+# ACS 5-year is available only for certain years; keep the intersection
+acs_years <- analysis_years[analysis_years >= 2009]
+
+if (length(acs_years) == 0L) {
+  stop("No ACS-compatible years found in analysis_years (need >= 2009).")
+}
+
+acs_vars <- c(
+  total_pop     = "B01003_001",
+  median_income = "B19013_001"
+)
+
+pull_acs_ny_counties <- function(years, vars) {
+  message("Pulling ACS 5-year data for NY counties (population + median income)...")
+  purrr::map_dfr(
+    years,
+    function(y) {
+      message(glue::glue("  - Year {y}"))
+      tidycensus::get_acs(
+        geography   = "county",
+        state       = "NY",
+        year        = y,
+        survey      = "acs5",
+        variables   = vars,
+        cache_table = TRUE,
+        geometry    = FALSE
+      ) |>
+        dplyr::mutate(year = y)
+    }
+  )
+}
+
+acs_ny_counties_raw <- pull_acs_ny_counties(acs_years, acs_vars)
+
+glimpse(acs_ny_counties_raw)
+
+readr::write_rds(acs_ny_counties_raw, "data_raw/acs/acs_ny_counties_raw.rds")
+```
+
+```{r}
+#| label: data-acs-clean
+
+acs_ny_counties_clean <- acs_ny_counties_raw |>
+  janitor::clean_names() |>
+  dplyr::mutate(
+    variable = dplyr::recode(
+      variable,
+      !!!setNames(names(acs_vars), acs_vars)
+    )
+  ) |>
+  dplyr::select(geoid, year, variable, estimate, moe) |>
+  tidyr::pivot_wider(
+    names_from  = variable,
+    values_from = c(estimate, moe),
+    names_glue  = "{variable}_{.value}"
+  ) |>
+  dplyr::rename(
+    total_pop         = total_pop_estimate,
+    total_pop_moe     = total_pop_moe,
+    median_income     = median_income_estimate,
+    median_income_moe = median_income_moe
+  ) |>
+  dplyr::mutate(
+    fips_state_county = geoid
+  )
+
+acs_nyc_boroughs <- acs_ny_counties_clean |>
+  dplyr::filter(fips_state_county %in% nyc_boroughs$fips_state_county) |>
+  dplyr::arrange(fips_state_county, year)
+
+glimpse(acs_nyc_boroughs)
+```
+This ACS table shows the 5-year estimates of total population and median household income for each NYC county, which I later use to normalize mortality and add basic socioeconomic context.
+
+```{r}
+#| label: data-borough-panel
+
+# Merge AQS, WONDER, and ACS into a single borough–year panel
+borough_panel <- analysis_grid |>
+  dplyr::left_join(
+    aqs_pm25_annual_nyc_bycounty |>
+      dplyr::select(fips_state_county, year, pm25_annual, n_monitors),
+    by = c("fips_state_county", "year")
+  ) |>
+  dplyr::left_join(
+    wonder_nyc |>
+      dplyr::select(
+        fips_state_county,
+        year,
+        deaths,
+        population,
+        crude_rate
+      ),
+    by = c("fips_state_county", "year")
+  ) |>
+  dplyr::left_join(
+    acs_nyc_boroughs |>
+      dplyr::select(
+        fips_state_county,
+        year,
+        total_pop,
+        median_income
+      ),
+    by = c("fips_state_county", "year")
+  ) |>
+  dplyr::mutate(
+    mortality_rate_per_100k = dplyr::coalesce(
+      crude_rate,
+      dplyr::if_else(
+        !is.na(deaths) & !is.na(population),
+        (deaths / population) * 100000,
+        NA_real_
+      )
+    ),
+    pm25_data_available      = !is.na(pm25_annual),
+    mortality_data_available = !is.na(mortality_rate_per_100k),
+    pop_data_available       = !is.na(total_pop)
+  )
+
+glimpse(borough_panel)
+
+readr::write_rds(borough_panel, "data_raw/borough_panel_nyc.rds")
+```
+This is after merging AQS, WONDER, and ACS into a single borough–year panel
 
 ## Missing value analysis
+Before doing any analysis we wanted to be sure that the merged borough–year panel was truly usable. We therefore created simple completeness flags for each borough, year, and dataset (PM₂.₅, mortality, and population) and plotted them as a tile map. The first figure (“Where are the data complete?”) shows a solid block of “Available” tiles for every borough and every year between 2010 and 2019 across all three sources, which tells me that once we align the datasets and trim to the common window, there are no gaps at all. The second figure (“How many years of usable data do I have per borough?”) summarizes the same information numerically: each borough has ten out of ten possible years of non-missing PM₂.₅, mortality, and population values. Because the final analysis dataset is fully observed within this window, We do not need to impute or drop any borough-years due to missingness. Any limitations in the project therefore come from measurement issues (for example, how monitors are sited or how causes of death are coded), rather than from NA values in the data.
+
+
+```{r}
+#| label: data-missing-summary
+
+borough_completeness <- borough_panel |>
+  dplyr::group_by(borough) |>
+  dplyr::summarise(
+    n_years_total      = dplyr::n(),
+    n_years_pm25       = sum(pm25_data_available,      na.rm = TRUE),
+    n_years_mortality  = sum(mortality_data_available, na.rm = TRUE),
+    n_years_population = sum(pop_data_available,       na.rm = TRUE),
+    first_year         = min(year),
+    last_year          = max(year),
+    .groups            = "drop"
+  )
+
+borough_completeness
+```
+
+```{r}
+#| label: data-missing-heatmap
+#| fig-cap: "Data availability for PM2.5, mortality, and population by borough and year."
+
+missing_long <- borough_panel |>
+  dplyr::select(
+    borough,
+    year,
+    pm25       = pm25_data_available,
+    mortality  = mortality_data_available,
+    population = pop_data_available
+  ) |>
+  tidyr::pivot_longer(
+    cols      = c(pm25, mortality, population),
+    names_to  = "dataset",
+    values_to = "available"
+  ) |>
+  dplyr::mutate(
+    dataset = dplyr::recode(
+      dataset,
+      pm25       = "PM2.5",
+      mortality  = "Mortality",
+      population = "Population"
+    )
+  )
+
+ggplot(missing_long,
+       aes(x = year, y = borough, fill = available)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(
+    values = c(`TRUE` = "steelblue4", `FALSE` = "grey90"),
+    labels = c("Available", "Missing")
+  ) +
+  scale_x_continuous(
+    breaks = year_breaks,
+    minor_breaks = NULL,
+    limits = year_limits
+  ) +
+  facet_wrap(~ dataset, ncol = 1) +
+  labs(
+    title   = "Where are the data complete?",
+    x       = "Year",
+    y       = "Borough",
+    fill    = "Status",
+    caption = "Flags are based on merged borough panel: AQS, CDC WONDER, and ACS."
+  ) +
+  theme(legend.position = "bottom")
+```
+This plot shows that for every NYC borough, all three datasets—PM₂.₅, mortality, and population—are fully observed for each year from 2010 to 2019, so my merged borough–year panel has no gaps within the analysis window.
+```{r}
+#| label: data-missing-bars
+#| fig-cap: "Number of years with non-missing PM2.5, mortality, and population per borough."
+
+borough_completeness_long <- borough_completeness |>
+  dplyr::select(borough, n_years_pm25, n_years_mortality, n_years_population) |>
+  tidyr::pivot_longer(
+    cols      = starts_with("n_years_"),
+    names_to  = "dataset",
+    values_to = "n_years"
+  ) |>
+  dplyr::mutate(
+    dataset = dplyr::recode(
+      dataset,
+      n_years_pm25       = "PM2.5",
+      n_years_mortality  = "Mortality",
+      n_years_population = "Population"
+    )
+  )
+
+ggplot(borough_completeness_long,
+       aes(x = n_years, y = reorder(borough, n_years), fill = dataset)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "How many years of usable data do I have per borough?",
+    x     = "Number of years with non-missing values (2010–2019)",
+    y     = "Borough",
+    fill  = "Dataset"
+  ) +
+  theme(legend.position = "bottom")
+```
+This bar chart confirms that each borough has ten out of ten usable years for PM₂.₅, mortality, and population, meaning I don’t need to drop or impute any borough–years due to missing values.
+
+
+
+Saving up the data locally, which then after can be used in results.qmd file to plot the graphs.
+```{r}
+#| label: save-panels-for-results
+
+fs::dir_create("data_clean")
+
+readr::write_rds(nyc_boroughs, "data_clean/nyc_boroughs.rds")
+
+readr::write_rds(borough_panel, "data_clean/borough_panel.rds")
+
+
+# Build NY-wide county panel (all counties, not just NYC)
+
+ny_counties_sf <- tigris::counties(state = "NY", cb = TRUE, year = 2022)
+
+ny_counties_names <- ny_counties_sf |>
+  sf::st_drop_geometry() |>
+  dplyr::select(
+    fips_state_county = GEOID,
+    county_name       = NAME
+  )
+
+ny_county_panel <- aqs_pm25_annual_ny_bycounty |>
+  dplyr::select(
+    fips_state_county,
+    year,
+    pm25_annual,
+    n_monitors
+  ) |>
+  # keeping analysis years only
+  dplyr::filter(year %in% analysis_years) |>
+  # joining mortality from WONDER
+  dplyr::left_join(
+    wonder_ucd_clean |>
+      dplyr::select(
+        fips_state_county,
+        year,
+        deaths,
+        population,
+        crude_rate
+      ),
+    by = c("fips_state_county", "year")
+  ) |>
+  # joining ACS population + income
+  dplyr::left_join(
+    acs_ny_counties_clean |>
+      dplyr::select(
+        fips_state_county,
+        year,
+        total_pop,
+        median_income
+      ),
+    by = c("fips_state_county", "year")
+  ) |>
+  # adding county names
+  dplyr::left_join(
+    ny_counties_names,
+    by = "fips_state_county"
+  ) |>
+  # compute mortality rate and NY-C flag
+  dplyr::mutate(
+    mortality_rate_per_100k = dplyr::coalesce(
+      crude_rate,
+      dplyr::if_else(
+        !is.na(deaths) & !is.na(population),
+        (deaths / population) * 100000,
+        NA_real_
+      )
+    ),
+    is_nyc_borough = fips_state_county %in% nyc_boroughs$fips_state_county
+  )
+
+glimpse(ny_county_panel)
+
+# Save for results.qmd
+readr::write_rds(ny_county_panel, "data_clean/ny_county_panel.rds")
+```
+

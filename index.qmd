@@ -1,1 +1,45 @@
 # Introduction
+We chose to focus on air pollution and respiratory health in New York City’s five boroughs because it sits at the intersection of something very concrete (daily air quality) and something deeply human (who gets sick, and where). Fine particulate matter (PM2.5) is a key pollutant that people increasingly hear about in news alerts and air-quality apps, but it is not always obvious how differences across neighborhoods or boroughs translate into actual health outcomes such as asthma and COPD deaths. In this project, We used publicly available data from the EPA, CDC WONDER, and the American Community Survey to build a borough-year panel for New York City and compare it with the rest of New York State. I’m especially interested in three questions: how PM2.5 trends differ across the five boroughs over time, whether boroughs with higher PM2.5 levels also tend to have higher asthma/COPD mortality in the same years, and which boroughs stand out as outliers once I account for population size. Our goal is not to make causal claims, but to provide an exploratory, visual story about how air quality and respiratory mortality co-evolve across the city in a way that a nontechnical reader can follow.
+
+
+
+```{r}
+#| label: setup-intro
+
+# Light setup for the intro chapter
+required_pkgs <- c("tidyverse", "lubridate", "janitor", "glue")
+
+installed <- rownames(installed.packages())
+for (p in required_pkgs) {
+  if (!p %in% installed) {
+    install.packages(p)
+  }
+}
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+# Global options and a simple, readable theme
+options(
+  scipen = 999,
+  dplyr.summarise.inform = FALSE
+)
+
+theme_set(
+  theme_minimal(base_family = "sans") +
+    theme(
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      panel.grid.minor      = element_blank()
+    )
+)
+
+# Research questions for this project
+project_questions <- tibble::tribble(
+  ~id,  ~question,
+  "Q1", "Do annual PM2.5 levels differ across the five NYC boroughs (Bronx, Brooklyn, Manhattan, Queens, Staten Island), and how have they changed over time?",
+  "Q2", "Are higher borough-year PM2.5 levels associated with asthma/COPD mortality?",
+  "Q3", "After normalizing by population, which boroughs are outliers, and how do they compare with the rest of New York State?"
+)
+
+project_questions
+```
+
